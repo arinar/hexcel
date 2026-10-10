@@ -15,6 +15,9 @@ HEX_LINE_WIDTH = .2
 CURSOR_LINE_WIDTH = 2.5
 HANDLE_SIZE_PX = 4.5
 FILL_HIT_RADIUS = 12.
+HEADER_LEFT_W = 32.
+HEADER_TOP_H = 24.
+HEADER_FONT_SIZE = 11.
 
 FONT_FACE = "Sans"
 FONT_SIZE_FRAC = .5
@@ -22,12 +25,19 @@ FONT_SIZE_FRAC = .5
 INITIAL_ANGLE = math.radians(11.7)
 ROT_PER_SCROLL = math.radians(5.)
 ZOOM_PER_SCROLL = 1.1
+MIN_ZOOM = 1. / 3.
+MAX_ZOOM = 10. / 3.
+HEADER_BORDER_WIDTH = .4
 
 COL_BG = (1., 1., 1.)
 COL_FG = (0., 0., 0.)
 # excel-ish selection green.
 COL_SELECTION = (.1, .5, .3)
 COL_FILL_PREVIEW = (1., 0., 0.)
+COL_HEADER_BG = (.93, .93, .93)
+COL_HEADER_BG_SEL = (.8, .8, .8)
+COL_HEADER_FG = (.3, .3, .3)
+HEADER_SEL_BORDER_WIDTH = 2.
 SEL_LINE_WIDTH = 1.5
 SEL_ALPHA = .18
 
@@ -107,6 +117,7 @@ EDGE_NEIGHBORS = [
 	( 1,  0, -1),
 	( 1, -1,  0),
 ]
+EDGE_ZERO_INDEX = tuple(d.index(0) for d in EDGE_NEIGHBORS)
 
 def fill_direction_and_steps(view, offset_x, offset_y):
 	# pick the hex axis most aligned with the drag delta, in screen space.
@@ -343,10 +354,261 @@ def draw_fill_preview(ctx, view):
 	new_cells, _ = fill_plan(view)
 	draw_region_outline(ctx, view, set(new_cells), COL_FILL_PREVIEW)
 
+def _cell_with_coord(idx, v):
+	# any valid cube cell with coord idx set to v.
+	if idx == 0: return (v, 0, -v)
+	if idx == 1: return (0, v, -v)
+	return (-v, 0, v)
+
+def _coord_range(w, h, view, idx):
+	q0, q1, r0, r1 = visible_axial_range(w, h, view)
+	if idx == 0: return range(q0, q1 + 1)
+	if idx == 2: return range(r0, r1 + 1)
+	return range(-q1 - r1, -q0 - r0 + 1)
+
+# for each fuse_axis a, the two consecutive right-side edges (those whose
+# neighbor sits at fuse_axis = +1) start at this k. the three right-side
+# vertices in order along the canonical fuse direction are corners[k_start..+2].
+# the canonical direction is chosen so iterating cells in it and emitting
+# vertices k_start..k_start+2 per cell produces a connected zigzag polyline.
+_K_START_RIGHT   = (4, 2, 0)
+_CANONICAL_FUSE  = (( 0, -1,  1), ( 1,  0, -1), (-1,  1,  0))
+
+def zigzag_vertices(view, fuse_axis, v, bbox):
+	# ordered vertices of the zigzag between cells of fuse_axis=v and v+1.
+	# only iterates cells whose center sits inside bbox padded by one hex size.
+	k_start = _K_START_RIGHT[fuse_axis]
+	direction = _CANONICAL_FUSE[fuse_axis]
+	size, angle = view.size, view.angle
+	ref = _cell_with_coord(fuse_axis, v)
+	rx, ry = cube_to_pixel(ref[0], ref[2], angle, size)
+	cx0 = view.ox + rx
+	cy0 = view.oy + ry
+	sx, sy = cube_to_pixel(direction[0], direction[2], angle, size)
+	xmin, ymin, xmax, ymax = bbox
+	pad = size
+	# find n range such that (cx0 + n*sx, cy0 + n*sy) in [xmin-pad, xmax+pad] x [ymin-pad, ymax+pad].
+	n_lo, n_hi = -1e9, 1e9
+	for s, c0, lo, hi in ((sx, cx0, xmin - pad, xmax + pad),
+			(sy, cy0, ymin - pad, ymax + pad)):
+		if s == 0.:
+			if not (lo <= c0 <= hi): return []
+			continue
+		a = (lo - c0) / s
+		b = (hi - c0) / s
+		if a > b: a, b = b, a
+		n_lo = max(n_lo, math.ceil(a))
+		n_hi = min(n_hi, math.floor(b))
+	if n_lo > n_hi: return []
+	# precompute the three vertex offsets from any cell center.
+	offs = []
+	for i in range(3):
+		a = angle + math.pi / 6. + ((k_start + i) % 6) * math.pi / 3.
+		offs.append((size * math.cos(a), size * math.sin(a)))
+	pts = []
+	for n in range(int(n_lo), int(n_hi) + 1):
+		cx = cx0 + n * sx
+		cy = cy0 + n * sy
+		for ox, oy in offs:
+			pts.append((cx + ox, cy + oy))
+	return pts
+
+def _interp_x_at_y(pts, y):
+	for i in range(len(pts) - 1):
+		x1, y1 = pts[i]
+		x2, y2 = pts[i + 1]
+		if y1 == y2: continue
+		if min(y1, y2) <= y <= max(y1, y2):
+			return x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+	return None
+
+def _interp_y_at_x(pts, x):
+	for i in range(len(pts) - 1):
+		x1, y1 = pts[i]
+		x2, y2 = pts[i + 1]
+		if x1 == x2: continue
+		if min(x1, x2) <= x <= max(x1, x2):
+			return y1 + (x - x1) * (y2 - y1) / (x2 - x1)
+	return None
+
+def _strip_v_range(view, bbox, fuse_axis):
+	# fuse_axis coord values of cells reaching into the bbox. derived from the
+	# cube coord at the four bbox corners.
+	xmin, ymin, xmax, ymax = bbox
+	vs = []
+	for sx, sy in ((xmin, ymin), (xmax, ymin), (xmin, ymax), (xmax, ymax)):
+		q, r = pixel_to_axial(sx, sy, view)
+		cube = (q, -q - r, r)
+		vs.append(cube[fuse_axis])
+	return int(math.floor(min(vs))) - 1, int(math.ceil(max(vs))) + 1
+
+def _draw_header_grid_strip(ctx, w, h, view, clip_rect, fuse_axis):
+	ctx.save()
+	ctx.rectangle(*clip_rect); ctx.clip()
+	ctx.set_source_rgb(*COL_FG)
+	ctx.set_line_width(HEADER_BORDER_WIDTH)
+	bbox = (clip_rect[0], clip_rect[1],
+			clip_rect[0] + clip_rect[2], clip_rect[1] + clip_rect[3])
+	v_lo, v_hi = _strip_v_range(view, bbox, fuse_axis)
+	for v in range(v_lo, v_hi + 1):
+		pts = zigzag_vertices(view, fuse_axis, v, bbox)
+		if not pts: continue
+		ctx.move_to(*pts[0])
+		for pt in pts[1:]:
+			ctx.line_to(*pt)
+	ctx.stroke()
+	ctx.restore()
+
+def _label_pos_top(v, iv, view, down_px, down_py):
+	cell = _cell_with_coord(iv, v)
+	px, py = cube_to_pixel(cell[0], cell[2], view.angle, view.size)
+	cx, cy = view.ox + px, view.oy + py
+	t = (HEADER_TOP_H / 2. - cy) / down_py
+	return cx + t * down_px
+
+def _label_pos_left(v, ih, view, right_px, right_py):
+	cell = _cell_with_coord(ih, v)
+	px, py = cube_to_pixel(cell[0], cell[2], view.angle, view.size)
+	cx, cy = view.ox + px, view.oy + py
+	t = (HEADER_LEFT_W / 2. - cx) / right_px
+	return cy + t * right_py
+
+def _draw_sel_bg_top(ctx, w, h, view, iv, lo_v, hi_v):
+	# extend bbox above and below the strip so the polygon's implicit top and
+	# bottom closures sit outside the clip rectangle.
+	bbox = (HEADER_LEFT_W, -2. * view.size, w, HEADER_TOP_H + 2. * view.size)
+	left = zigzag_vertices(view, iv, lo_v - 1, bbox)
+	right = zigzag_vertices(view, iv, hi_v, bbox)
+	if not left or not right: return
+	ctx.save()
+	ctx.rectangle(HEADER_LEFT_W, 0, w - HEADER_LEFT_W, HEADER_TOP_H); ctx.clip()
+	ctx.set_source_rgb(*COL_HEADER_BG_SEL)
+	ctx.move_to(*left[0])
+	for pt in left[1:]: ctx.line_to(*pt)
+	for pt in reversed(right): ctx.line_to(*pt)
+	ctx.close_path(); ctx.fill()
+	ctx.restore()
+
+def _draw_sel_bg_left(ctx, w, h, view, ih, lo_v, hi_v):
+	bbox = (-2. * view.size, HEADER_TOP_H, HEADER_LEFT_W + 2. * view.size, h)
+	top = zigzag_vertices(view, ih, lo_v - 1, bbox)
+	bot = zigzag_vertices(view, ih, hi_v, bbox)
+	if not top or not bot: return
+	ctx.save()
+	ctx.rectangle(0, HEADER_TOP_H, HEADER_LEFT_W, h - HEADER_TOP_H); ctx.clip()
+	ctx.set_source_rgb(*COL_HEADER_BG_SEL)
+	ctx.move_to(*top[0])
+	for pt in top[1:]: ctx.line_to(*pt)
+	for pt in reversed(bot): ctx.line_to(*pt)
+	ctx.close_path(); ctx.fill()
+	ctx.restore()
+
+def _draw_sel_border_top(ctx, w, h, view, iv, lo_v, hi_v):
+	y = HEADER_TOP_H - 1.
+	bbox = (HEADER_LEFT_W, y - view.size, w, y + view.size)
+	left = zigzag_vertices(view, iv, lo_v - 1, bbox)
+	right = zigzag_vertices(view, iv, hi_v, bbox)
+	lx = _interp_x_at_y(left, y)
+	rx = _interp_x_at_y(right, y)
+	if lx is None or rx is None: return
+	if lx > rx: lx, rx = rx, lx
+	lx = max(lx, HEADER_LEFT_W); rx = min(rx, w)
+	if lx >= rx: return
+	ctx.set_source_rgb(*COL_SELECTION)
+	ctx.set_line_width(HEADER_SEL_BORDER_WIDTH)
+	ctx.move_to(lx, y); ctx.line_to(rx, y); ctx.stroke()
+
+def _draw_sel_border_left(ctx, w, h, view, ih, lo_v, hi_v):
+	x = HEADER_LEFT_W - 1.
+	bbox = (x - view.size, HEADER_TOP_H, x + view.size, h)
+	top = zigzag_vertices(view, ih, lo_v - 1, bbox)
+	bot = zigzag_vertices(view, ih, hi_v, bbox)
+	ty = _interp_y_at_x(top, x)
+	by = _interp_y_at_x(bot, x)
+	if ty is None or by is None: return
+	if ty > by: ty, by = by, ty
+	ty = max(ty, HEADER_TOP_H); by = min(by, h)
+	if ty >= by: return
+	ctx.set_source_rgb(*COL_SELECTION)
+	ctx.set_line_width(HEADER_SEL_BORDER_WIDTH)
+	ctx.move_to(x, ty); ctx.line_to(x, by); ctx.stroke()
+
+def draw_headers(ctx, w, h, view):
+	down  = neighbor_for_screen_direction(view, math.pi / 2.)
+	right = neighbor_for_screen_direction(view, 0.)
+	iv = down.index(0)
+	ih = right.index(0)
+	down_px, down_py = cube_to_pixel(down[0], down[2], view.angle, view.size)
+	right_px, right_py = cube_to_pixel(right[0], right[2], view.angle, view.size)
+	top_ok  = down_py != 0.
+	left_ok = right_px != 0.
+	sel = view.focus is not None
+	# strip backgrounds. the corner stays untouched (sheet background shows).
+	ctx.set_source_rgb(*COL_HEADER_BG)
+	ctx.rectangle(HEADER_LEFT_W, 0, w - HEADER_LEFT_W, HEADER_TOP_H); ctx.fill()
+	ctx.rectangle(0, HEADER_TOP_H, HEADER_LEFT_W, h - HEADER_TOP_H); ctx.fill()
+	# selection-range darker bg: parallelogram bounded by the two zigzags
+	# flanking the selection and by the strip's inner top/bottom edges.
+	if sel:
+		_draw_sel_bg_top (ctx, w, h, view, iv, view.lo[iv], view.hi[iv])
+		_draw_sel_bg_left(ctx, w, h, view, ih, view.lo[ih], view.hi[ih])
+	# fused hex grid in each strip (one connected polyline per zigzag).
+	_draw_header_grid_strip(ctx, w, h, view,
+			(HEADER_LEFT_W, 0, w - HEADER_LEFT_W, HEADER_TOP_H), iv)
+	_draw_header_grid_strip(ctx, w, h, view,
+			(0, HEADER_TOP_H, HEADER_LEFT_W, h - HEADER_TOP_H), ih)
+	# flat-ui divider lines between the strips and the sheet. .5 offset puts
+	# the stroke center on a pixel-row/column center. the dividers stop at the
+	# corner edges so nothing is drawn in the corner.
+	ctx.set_source_rgb(*COL_FG)
+	ctx.set_line_width(HEADER_BORDER_WIDTH)
+	y = HEADER_TOP_H - .5
+	ctx.move_to(HEADER_LEFT_W, y); ctx.line_to(w, y); ctx.stroke()
+	x = HEADER_LEFT_W - .5
+	ctx.move_to(x, HEADER_TOP_H); ctx.line_to(x, h); ctx.stroke()
+	# thickened green border piece spanning the selection, snapped to the
+	# zigzag intersections at the inner edge of the strip.
+	if sel:
+		_draw_sel_border_top (ctx, w, h, view, iv, view.lo[iv], view.hi[iv])
+		_draw_sel_border_left(ctx, w, h, view, ih, view.lo[ih], view.hi[ih])
+	# labels: coord number per column/row. green when inside the selection
+	# range; default header-fg otherwise.
+	ctx.select_font_face(FONT_FACE)
+	ctx.set_font_size(HEADER_FONT_SIZE)
+	mid_y = HEADER_TOP_H / 2.
+	if top_ok:
+		for v in _coord_range(w, h, view, iv):
+			lx = _label_pos_top(v, iv, view, down_px, down_py)
+			if lx < HEADER_LEFT_W or lx > w: continue
+			s = str(v)
+			xb, yb, tw, th, _, _ = ctx.text_extents(s)
+			if sel and view.lo[iv] <= v <= view.hi[iv]:
+				ctx.set_source_rgb(*COL_SELECTION)
+			else:
+				ctx.set_source_rgb(*COL_HEADER_FG)
+			ctx.move_to(lx - tw / 2. - xb, mid_y - th / 2. - yb)
+			ctx.show_text(s)
+	mid_x = HEADER_LEFT_W / 2.
+	if left_ok:
+		for v in _coord_range(w, h, view, ih):
+			ly = _label_pos_left(v, ih, view, right_px, right_py)
+			if ly < HEADER_TOP_H or ly > h: continue
+			s = str(v)
+			xb, yb, tw, th, _, _ = ctx.text_extents(s)
+			if sel and view.lo[ih] <= v <= view.hi[ih]:
+				ctx.set_source_rgb(*COL_SELECTION)
+			else:
+				ctx.set_source_rgb(*COL_HEADER_FG)
+			ctx.move_to(mid_x - tw / 2. - xb, ly - th / 2. - yb)
+			ctx.show_text(s)
+
 def draw(ctx, w, h, view):
 	ctx.set_antialias(cairo.ANTIALIAS_BEST)
 	ctx.set_source_rgb(*COL_BG)
 	ctx.paint()
+	ctx.save()
+	ctx.rectangle(HEADER_LEFT_W, HEADER_TOP_H, w - HEADER_LEFT_W, h - HEADER_TOP_H)
+	ctx.clip()
 	draw_selection_fill(ctx, w, h, view)
 	draw_grid_lines(ctx, w, h, view)
 	draw_cell_contents(ctx, w, h, view)
@@ -356,6 +618,8 @@ def draw(ctx, w, h, view):
 		draw_handle(ctx, view)
 		draw_caret(ctx, view)
 	draw_fill_preview(ctx, view)
+	ctx.restore()
+	draw_headers(ctx, w, h, view)
 
 ########################################################################################## state
 
@@ -435,9 +699,11 @@ def rotate_around(view, sx, sy, delta):
 
 def zoom_around(view, sx, sy, factor):
 	# scale size by factor while keeping screen point (sx, sy) over the same grid cell.
+	new_size = max(HEX_SIZE * MIN_ZOOM, min(HEX_SIZE * MAX_ZOOM, view.size * factor))
+	factor = new_size / view.size
 	view.ox = sx - factor * (sx - view.ox)
 	view.oy = sy - factor * (sy - view.oy)
-	view.size *= factor
+	view.size = new_size
 
 def cell_at_pixel(sx, sy, view):
 	fq, fr = pixel_to_axial(sx, sy, view)
